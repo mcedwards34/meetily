@@ -154,19 +154,16 @@ pub async fn get_device_and_config(
 
                 #[cfg(target_os = "linux")]
                 {
-                    // For Linux, we use PulseAudio monitor sources for system audio
-                    if let Ok(pulse_host) = cpal::host_from_id(cpal::HostId::Alsa) {
-                        for device in pulse_host.input_devices()? {
-                            if let Ok(name) = device.name() {
-                                if name == audio_device.name {
-                                    let default_config = device
-                                        .default_input_config()
-                                        .map_err(|e| anyhow!("Failed to get default input config: {}", e))?;
-                                    return Ok((device, default_config));
-                                }
-                            }
-                        }
-                    }
+                    // Linux system-audio capture does not go through cpal at all: PipeWire/
+                    // PulseAudio monitor sources aren't real ALSA PCM devices, so cpal's ALSA
+                    // host can't open them. `AudioStream::create_with_backend` (stream.rs)
+                    // routes DeviceType::System to `create_pulseaudio_stream`, which resolves
+                    // and opens the monitor source directly via `capture::system` and never
+                    // calls this function. This branch should be unreachable in practice.
+                    return Err(anyhow!(
+                        "Linux system audio must be opened via the PulseAudio capture path, not cpal: {}",
+                        audio_device.name
+                    ));
                 }
             }
         }

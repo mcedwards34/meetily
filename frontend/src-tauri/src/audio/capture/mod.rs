@@ -17,6 +17,9 @@ pub use system::{
 #[cfg(target_os = "macos")]
 pub use core_audio::{CoreAudioCapture, CoreAudioStream};
 
+#[cfg(target_os = "linux")]
+pub use system::{resolve_monitor_source, start_monitor_capture, PulseAudioCaptureHandle};
+
 // Re-export backend configuration
 pub use backend_config::{
     AudioCaptureBackend, BackendConfig, BACKEND_CONFIG,
