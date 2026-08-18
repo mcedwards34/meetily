@@ -13,6 +13,9 @@ use super::capture::{AudioCaptureBackend, get_current_backend};
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
 
+#[cfg(target_os = "linux")]
+use super::capture::{resolve_monitor_source, start_monitor_capture, PulseAudioCaptureHandle};
+
 /// Stream backend implementation
 pub enum StreamBackend {
     /// CPAL-based stream (ScreenCaptureKit or default)
@@ -22,6 +25,9 @@ pub enum StreamBackend {
     CoreAudio {
         task: Option<tokio::task::JoinHandle<()>>,
     },
+    /// PulseAudio/PipeWire monitor-source capture (Linux system audio only)
+    #[cfg(target_os = "linux")]
+    PulseAudio(PulseAudioCaptureHandle),
 }
 
 // SAFETY: While Stream doesn't implement Send, we ensure it's only accessed
@@ -85,6 +91,15 @@ impl AudioStream {
         if use_core_audio {
             info!("🎵 Stream: Using Core Audio backend (cidre) for system audio");
             return Self::create_core_audio_stream(device, state, device_type, recording_sender).await;
+        }
+
+        // Linux has no cpal path for system audio at all: PipeWire/PulseAudio monitor
+        // sources aren't real ALSA PCM devices, so cpal's ALSA host can never open one.
+        // System audio always goes through PulseAudio directly here.
+        #[cfg(target_os = "linux")]
+        if device_type == DeviceType::System {
+            info!("🎵 Stream: Using PulseAudio backend for system audio (Linux)");
+            return Self::create_pulseaudio_stream(device, state, device_type, recording_sender).await;
         }
 
         // Default path: use CPAL
@@ -233,6 +248,41 @@ impl AudioStream {
         })
     }
 
+    /// Create a PulseAudio/PipeWire monitor-source stream (Linux system audio only)
+    #[cfg(target_os = "linux")]
+    async fn create_pulseaudio_stream(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<Self> {
+        info!("🔊 Stream: Resolving PulseAudio monitor source for device: {}", device.name);
+
+        let monitor_source = resolve_monitor_source(Some(&device.name))?;
+        info!("🔊 Stream: Opening PulseAudio monitor source: {}", monitor_source);
+
+        // The PulseAudio server is asked to deliver mono 48kHz directly (see
+        // capture::system::start_monitor_capture), so AudioCapture's own resampler
+        // stays disabled, matching the Core Audio path's fixed-format assumption.
+        let capture = AudioCapture::new(
+            device.clone(),
+            state.clone(),
+            48_000,
+            1,
+            device_type,
+            recording_sender,
+        );
+
+        let handle = start_monitor_capture(&monitor_source, capture)?;
+
+        info!("✅ Stream: PulseAudio stream started for device: {}", device.name);
+
+        Ok(Self {
+            device,
+            backend: StreamBackend::PulseAudio(handle),
+        })
+    }
+
     /// Build stream based on sample format
     fn build_stream(
         device: &Device,
@@ -342,6 +392,12 @@ impl AudioStream {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     info!("Core Audio task aborted");
                 }
+            }
+            #[cfg(target_os = "linux")]
+            StreamBackend::PulseAudio(handle) => {
+                info!("Stopping PulseAudio capture thread...");
+                handle.stop();
+                info!("PulseAudio capture thread stopped");
             }
         }
 
