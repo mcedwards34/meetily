@@ -97,6 +97,12 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
+        // Whether each stream is actually expected for this recording -- lets the
+        // mixing ring buffer wait for both streams when both are active instead of
+        // extracting a window as soon as either one is ready (see pipeline.rs).
+        let has_mic = microphone_device.is_some();
+        let has_system = system_device.is_some();
+
         // Update recording metadata with device information
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
@@ -114,8 +120,10 @@ impl RecordingManager {
             Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
             mic_name,
             mic_kind,
+            has_mic,
             sys_name,
             sys_kind,
+            has_system,
         )?;
 
         // Give the pipeline a moment to fully initialize before starting streams

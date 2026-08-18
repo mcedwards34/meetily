@@ -18,31 +18,54 @@ use super::vad::{ContinuousVadProcessor};
 struct AudioMixerRingBuffer {
     mic_buffer: VecDeque<f32>,
     system_buffer: VecDeque<f32>,
-    window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
-    max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    window_size_samples: usize,  // Fixed mixing window (600ms)
+    max_buffer_size: usize,  // Safety limit (2x window)
+    expect_mic: bool,
+    expect_system: bool,
+    // Set the first time exactly one *expected* stream is ready but the other isn't;
+    // cleared once both are ready. Lets can_mix() wait for genuine cross-stream sync
+    // instead of extracting (and zero-padding the lagging side) as soon as either
+    // stream alone reaches a full window.
+    waiting_since: Option<std::time::Instant>,
+    max_wait: std::time::Duration,
 }
 
 impl AudioMixerRingBuffer {
-    fn new(sample_rate: u32) -> Self {
-        // Use 50ms windows for mixing
+    fn new(sample_rate: u32, expect_mic: bool, expect_system: bool) -> Self {
+        Self::with_max_wait(sample_rate, expect_mic, expect_system, std::time::Duration::from_millis(150))
+    }
+
+    // Split out so tests can inject a small max_wait instead of sleeping 150ms per test.
+    fn with_max_wait(
+        sample_rate: u32,
+        expect_mic: bool,
+        expect_system: bool,
+        max_wait: std::time::Duration,
+    ) -> Self {
+        // 600ms windows for mixing -- tolerates cross-platform producer jitter
+        // (e.g. macOS Core Audio batching, Linux PulseAudio thread scheduling).
         let window_ms = 600.0;
         let window_size_samples = (sample_rate as f32 * window_ms / 1000.0) as usize;
 
-        // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
-        // System audio (especially Core Audio on macOS) can have significant jitter
-        // due to sample-by-sample streaming → batching → channel transmission
-        // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
-        let max_buffer_size = window_size_samples * 8;  // 400ms (was 200ms)
+        // Safety margin above one full window's worth of samples, for the
+        // overflow-drop guard below. Proportionate to the current 600ms window
+        // (previously an 8x multiplier left over from an earlier 50ms-window design,
+        // which computed to ~4.8s here and made the overflow guard practically dead).
+        let max_buffer_size = window_size_samples * 2;
 
-        info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
-              window_ms, window_size_samples,
-              window_ms * 8.0, max_buffer_size);
+        info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={} samples, \
+               expect_mic={}, expect_system={}, max_wait={:?}",
+              window_ms, window_size_samples, max_buffer_size, expect_mic, expect_system, max_wait);
 
         Self {
             mic_buffer: VecDeque::with_capacity(max_buffer_size),
             system_buffer: VecDeque::with_capacity(max_buffer_size),
             window_size_samples,
             max_buffer_size,
+            expect_mic,
+            expect_system,
+            waiting_since: None,
+            max_wait,
         }
     }
 
@@ -84,9 +107,40 @@ impl AudioMixerRingBuffer {
         }
     }
 
-    fn can_mix(&self) -> bool {
-        self.mic_buffer.len() >= self.window_size_samples ||
-        self.system_buffer.len() >= self.window_size_samples
+    fn can_mix(&mut self) -> bool {
+        // Defensive: if literally nothing is expected, never synthesize silence
+        // (shouldn't happen -- stream.rs requires at least one device -- but costs
+        // nothing to guard against becoming a live regression).
+        if !self.expect_mic && !self.expect_system {
+            return false;
+        }
+
+        let mic_ready = !self.expect_mic || self.mic_buffer.len() >= self.window_size_samples;
+        let sys_ready = !self.expect_system || self.system_buffer.len() >= self.window_size_samples;
+
+        if mic_ready && sys_ready {
+            // Healthy (also covers the single-expected-stream case). Only reset the
+            // wait timer here -- NOT after every extraction -- so a stream that's
+            // genuinely, permanently stalled doesn't re-pay the full grace period
+            // before every subsequent window.
+            self.waiting_since = None;
+            return true;
+        }
+
+        if self.expect_mic && self.expect_system && (mic_ready ^ sys_ready) {
+            let started = *self.waiting_since.get_or_insert_with(std::time::Instant::now);
+            if started.elapsed() >= self.max_wait {
+                // Grace period exceeded: one stream is genuinely stalled (device
+                // hiccup, capture thread died). Fall through to padded extraction
+                // rather than blocking the healthy stream -- and therefore the whole
+                // pipeline (no transcription, no recording output) -- indefinitely.
+                return true;
+            }
+        } else {
+            self.waiting_since = None;
+        }
+
+        false
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
@@ -162,14 +216,11 @@ impl ProfessionalAudioMixer {
             let mic = mic_window.get(i).copied().unwrap_or(0.0);
             let sys = sys_window.get(i).copied().unwrap_or(0.0);
 
-            // Pre-scale system audio to 70% to leave headroom
-            // This prevents constant soft scaling which can cause pumping artifacts
-            // Mic is normalized to -23 LUFS (already optimal), system needs reduction
-            let sys_scaled = sys * 1.0;
-            let _mic_scaled = mic * 0.8;  // Reserved for future mic scaling
-
-            // Sum without ducking - mic stays at full volume, system slightly reduced
-            let sum = mic + sys_scaled;
+            // No pre-scaling is applied to either stream: mic is already normalized to
+            // -23 LUFS (EBU R128) upstream at capture time; system audio sums at its
+            // natural level. Soft-scaling below (not hard clipping) is the only
+            // headroom protection.
+            let sum = mic + sys;
 
             // CRITICAL FIX: Soft scaling prevents distortion artifacts
             // If the sum would exceed ±1.0, scale down PROPORTIONALLY
@@ -705,8 +756,10 @@ impl AudioPipeline {
         sample_rate: u32,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
+        has_mic: bool,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        has_system: bool,
     ) -> Self {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
@@ -738,7 +791,7 @@ impl AudioPipeline {
         };
 
         // Initialize professional audio mixing components
-        let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
+        let ring_buffer = AudioMixerRingBuffer::new(sample_rate, has_mic, has_system);
         let mixer = ProfessionalAudioMixer::new(sample_rate);
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
@@ -964,8 +1017,10 @@ impl AudioPipelineManager {
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
+        has_mic: bool,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        has_system: bool,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -987,8 +1042,10 @@ impl AudioPipelineManager {
             sample_rate,
             mic_device_name,
             mic_device_kind,
+            has_mic,
             system_device_name,
             system_device_kind,
+            has_system,
         );
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
@@ -1076,5 +1133,129 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod ring_buffer_sync_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const SAMPLE_RATE: u32 = 48_000;
+
+    fn count_zeros(window: &[f32]) -> usize {
+        window.iter().filter(|&&s| s == 0.0).count()
+    }
+
+    #[test]
+    fn both_streams_required_before_extraction() {
+        let mut rb = AudioMixerRingBuffer::with_max_wait(
+            SAMPLE_RATE, true, true, Duration::from_secs(10),
+        );
+        let window = rb.window_size_samples;
+
+        rb.add_samples(DeviceType::System, vec![0.7; window]);
+        rb.add_samples(DeviceType::Microphone, vec![0.5; window - 1]);
+        assert!(!rb.can_mix(), "should not mix while mic is short one sample");
+
+        rb.add_samples(DeviceType::Microphone, vec![0.5]);
+        assert!(rb.can_mix(), "should mix once both streams have a full window");
+
+        let (mic_window, sys_window) = rb.extract_window().expect("window expected");
+        assert_eq!(count_zeros(&mic_window), 0, "mic window should contain no padding");
+        assert_eq!(count_zeros(&sys_window), 0, "system window should contain no padding");
+    }
+
+    #[test]
+    fn jittery_uneven_arrival_no_premature_padding() {
+        let mut rb = AudioMixerRingBuffer::with_max_wait(
+            SAMPLE_RATE, true, true, Duration::from_secs(10),
+        );
+        let window = rb.window_size_samples;
+
+        // Mic delivers irregular cpal-style chunk sizes; system delivers fixed
+        // 960-sample (20ms) chunks, matching the real PulseAudio capture thread.
+        let mut mic_sent = 0;
+        let mic_chunk_sizes = [256usize, 512, 128, 1024, 300];
+        let mut i = 0;
+        while mic_sent < window {
+            let size = mic_chunk_sizes[i % mic_chunk_sizes.len()].min(window - mic_sent);
+            rb.add_samples(DeviceType::Microphone, vec![0.3; size]);
+            mic_sent += size;
+            i += 1;
+        }
+
+        let mut sys_sent = 0;
+        while sys_sent < window {
+            let size = 960.min(window - sys_sent);
+            rb.add_samples(DeviceType::System, vec![0.4; size]);
+            sys_sent += size;
+        }
+
+        assert!(rb.can_mix(), "both streams have a full window despite differing chunk sizes");
+        let (mic_window, sys_window) = rb.extract_window().expect("window expected");
+        assert_eq!(count_zeros(&mic_window), 0, "no padding should occur from chunk-size jitter alone");
+        assert_eq!(count_zeros(&sys_window), 0, "no padding should occur from chunk-size jitter alone");
+    }
+
+    #[test]
+    fn mic_only_recording_never_deadlocks() {
+        let mut rb = AudioMixerRingBuffer::with_max_wait(
+            SAMPLE_RATE, true, false, Duration::from_secs(3600),
+        );
+        let window = rb.window_size_samples;
+
+        rb.add_samples(DeviceType::Microphone, vec![0.6; window]);
+        assert!(rb.can_mix(), "mic-only recording must not depend on the timeout path");
+
+        let (mic_window, sys_window) = rb.extract_window().expect("window expected");
+        assert_eq!(count_zeros(&mic_window), 0);
+        assert!(sys_window.iter().all(|&s| s == 0.0), "no system device selected -> real silence, not a bug");
+    }
+
+    #[test]
+    fn permanently_stalled_stream_pads_without_repaying_grace_period() {
+        let mut rb = AudioMixerRingBuffer::with_max_wait(
+            SAMPLE_RATE, true, true, Duration::from_millis(20),
+        );
+        let window = rb.window_size_samples;
+
+        rb.add_samples(DeviceType::Microphone, vec![0.9; window]);
+        assert!(!rb.can_mix(), "grace period has not elapsed yet");
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(rb.can_mix(), "grace period elapsed -- forced extraction expected");
+        let (_, sys_window) = rb.extract_window().expect("window expected");
+        assert!(sys_window.iter().all(|&s| s == 0.0), "stalled system stream padded with silence");
+
+        // A second window arrives for the still-dead system stream: must not have to
+        // wait out another full grace period.
+        rb.add_samples(DeviceType::Microphone, vec![0.9; window]);
+        assert!(rb.can_mix(), "a permanently stalled stream should pad immediately, not re-wait");
+    }
+
+    #[test]
+    fn recovering_stream_gets_a_fresh_grace_period() {
+        let mut rb = AudioMixerRingBuffer::with_max_wait(
+            SAMPLE_RATE, true, true, Duration::from_millis(30),
+        );
+        let window = rb.window_size_samples;
+
+        // One normal, healthy extraction.
+        rb.add_samples(DeviceType::Microphone, vec![0.2; window]);
+        rb.add_samples(DeviceType::System, vec![0.2; window]);
+        assert!(rb.can_mix());
+        rb.extract_window();
+
+        // A fresh partial-readiness state should start its own wait, not inherit a
+        // stale timestamp from unrelated earlier state.
+        rb.add_samples(DeviceType::Microphone, vec![0.2; window]);
+        assert!(!rb.can_mix(), "freshly-started wait should not be immediately timed out");
+    }
+
+    #[test]
+    fn max_buffer_size_is_proportionate_to_window() {
+        let rb = AudioMixerRingBuffer::new(SAMPLE_RATE, true, true);
+        assert_eq!(rb.max_buffer_size, rb.window_size_samples * 2);
     }
 }
