@@ -318,6 +318,28 @@ pub fn start_monitor_capture(
         anyhow::bail!("Invalid PulseAudio sample spec (format/channels/rate)");
     }
 
+    // ~20ms @ 48kHz mono: matches CHUNK_SAMPLES below, frequent enough to keep
+    // stop() latency low without spinning.
+    const CHUNK_SAMPLES: usize = 960;
+
+    // CRITICAL: without an explicit BufferAttr, PulseAudio defaults to roughly 2
+    // SECONDS of buffering for a record stream (fragsize unset = server picks a
+    // large value optimized for low overhead, not latency). The microphone path
+    // via cpal has nowhere near that much latency, and the mixing ring buffer has
+    // no timestamp-based realignment between streams (it mixes purely by sample
+    // count) -- so that ~2s gap becomes a permanent offset between mic and system
+    // audio in every recording, audible as one stream's content arriving well
+    // ahead of / overlapping the other's. Requesting a small fragsize here brings
+    // system-audio latency down to roughly the same ballpark as the mic path.
+    let frag_bytes = (CHUNK_SAMPLES * std::mem::size_of::<f32>()) as u32;
+    let buffer_attr = libpulse_binding::def::BufferAttr {
+        maxlength: u32::MAX, // "don't care" sentinel (PulseAudio convention: -1 / u32::MAX)
+        tlength: u32::MAX,   // playback-only field, irrelevant for a record stream
+        prebuf: u32::MAX,    // playback-only field, irrelevant for a record stream
+        minreq: u32::MAX,    // playback-only field, irrelevant for a record stream
+        fragsize: frag_bytes, // the only field that matters for recording
+    };
+
     let simple = Simple::new(
         None, // default server
         "Meetily",
@@ -326,7 +348,7 @@ pub fn start_monitor_capture(
         "system-audio",
         &spec,
         None, // default channel map
-        None, // default buffering attributes
+        Some(&buffer_attr),
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -336,14 +358,19 @@ pub fn start_monitor_capture(
         )
     })?;
 
+    if let Ok(latency) = simple.get_latency() {
+        log::info!(
+            "PulseAudio system-audio capture latency for '{}': {} us",
+            monitor_source,
+            latency.0
+        );
+    }
+
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_stop_flag = stop_flag.clone();
     let monitor_source_owned = monitor_source.to_string();
 
     let thread = std::thread::spawn(move || {
-        // ~20ms @ 48kHz mono: frequent enough to keep stop() latency low without
-        // spinning, matching the 1024-sample chunking used by the Core Audio path.
-        const CHUNK_SAMPLES: usize = 960;
         let mut byte_buf = vec![0u8; CHUNK_SAMPLES * std::mem::size_of::<f32>()];
 
         log::info!(
