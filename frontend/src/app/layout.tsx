@@ -1,6 +1,7 @@
 'use client'
 
 import './globals.css'
+import Script from 'next/script'
 import { Source_Sans_3 } from 'next/font/google'
 import Sidebar from '@/components/Sidebar'
 import { SidebarProvider } from '@/components/Sidebar/SidebarProvider'
@@ -233,6 +234,33 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${sourceSans3.variable} font-sans antialiased`}>
+        {/* Runs before any Next.js module executes (injected directly into the
+            server-rendered HTML head), independent of whether the app's own JS
+            chunks load successfully -- specifically so it can catch and recover
+            from a ChunkLoadError on this very layout's own chunk, which a normal
+            React component mounted inside this tree structurally cannot do. */}
+        <Script id="chunk-error-reload" strategy="beforeInteractive">
+          {`
+            (function () {
+              function handleChunkError(event) {
+                var message = (event && event.reason)
+                  ? String((event.reason && event.reason.message) || event.reason)
+                  : (event && event.message) || '';
+                if (!/ChunkLoadError|Loading chunk .* failed/i.test(message)) return;
+
+                var key = 'meetily-chunk-reload-attempted';
+                try {
+                  if (sessionStorage.getItem(key)) return; // avoid a reload loop
+                  sessionStorage.setItem(key, '1');
+                } catch (e) {}
+
+                window.location.reload();
+              }
+              window.addEventListener('error', handleChunkError);
+              window.addEventListener('unhandledrejection', handleChunkError);
+            })();
+          `}
+        </Script>
         <AnalyticsProvider>
           <RecordingStateProvider>
             <TranscriptProvider>
