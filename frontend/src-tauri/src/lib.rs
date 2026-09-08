@@ -390,6 +390,20 @@ pub fn get_language_preference_internal() -> Option<String> {
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
+    // WebKitGTK's DMABUF renderer can fail to allocate buffers for GPU-composited
+    // layers on some NVIDIA/Mesa driver combos, leaving those layers permanently
+    // invisible (e.g. content animated in via CSS opacity never appears) while
+    // non-composited content renders fine. Default this off unless the user has
+    // already set it, so Linux users don't have to discover the env var themselves.
+    // If a blank/white content area persists, WEBKIT_DISABLE_COMPOSITING_MODE=1 is
+    // the next escalation step (disables HW-accelerated compositing entirely).
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
