@@ -22,6 +22,14 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     export CMAKE_POSITION_INDEPENDENT_CODE=ON
 fi
 
+# Note: WEBKIT_DISABLE_DMABUF_RENDERER=1 is applied automatically by the Rust
+# core on Linux (see frontend/src-tauri/src/lib.rs) to work around a WebKitGTK
+# bug on some NVIDIA/Mesa driver combos where GPU-composited content never
+# paints (app launches to a blank/white main content area, native chrome like
+# the sidebar renders fine). If a blank screen still occurs, try the stronger
+# escalation: WEBKIT_DISABLE_COMPOSITING_MODE=1 ./dev-gpu.sh
+# (disables WebKitGTK hardware-accelerated compositing entirely).
+
 # Detect OS
 if [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macos"
